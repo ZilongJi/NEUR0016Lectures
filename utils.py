@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 def compute_firing_rate_map(positions, spikes, timestamps, bin_size=2.5, smoothing=True, gaussian_sigma=2):
     """
