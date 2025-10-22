@@ -1,0 +1,236 @@
+# Sharp (1991) style competitive-learning place-cell simulation
+# Patricia E. Sharp (1991) Psychobiology 19(2):103–115.
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(0)
+
+# ----------------------------
+# Environment & “local view”
+# ----------------------------
+class CylinderEnv:
+    def __init__(self, diameter_cm=76.0, n_stimuli=8):
+        self.D = diameter_cm
+        self.R = diameter_cm/2
+        # place 8 point stimuli evenly on the wall (as in the paper)
+        angles = np.linspace(0, 2*np.pi, n_stimuli, endpoint=False)
+        self.stim_xy = np.c_[self.R*np.cos(angles), self.R*np.sin(angles)]
+
+    def wrap_to_arena(self, xy):
+        # keep inside circle by reflecting back toward centre if outside
+        r = np.linalg.norm(xy, axis=1)
+        mask = r > self.R
+        xy[mask] *= (self.R - 1e-6)/r[mask][:, None]
+        return xy
+
+    def random_trajectory(self, T_steps, step_frac_of_D=0.07):
+        # Paper sets step ≈ 7% of diameter at 8 Hz → realistic speed
+        step_len = step_frac_of_D*self.D
+        xy = np.zeros((T_steps, 2), dtype=float)
+        theta = rng.uniform(0, 2*np.pi)
+        xy[0] = rng.normal(0, self.R/3, size=2) # start near centre
+        for t in range(1, T_steps):
+            # mild zig-zag random walk with some persistence
+            theta = (theta + rng.normal(0, 0.7)) % (2*np.pi)
+            xy[t] = xy[t-1] + step_len*np.c_[np.cos(theta), np.sin(theta)]
+            xy[t:t+1] = self.wrap_to_arena(xy[t:t+1])
+        # head direction approximated by finite difference
+        vel = np.vstack([xy[1:] - xy[:-1], xy[-1:] - xy[-2:-1]])
+        hd  = (np.arctan2(vel[:,1], vel[:,0]) + 2*np.pi)%(2*np.pi)
+        return xy, hd
+
+def local_view_features(xy, hd, stim_xy,
+                        n_L1_type1=30, n_L1_type2=30,
+                        p_responsive=0.17,
+                        dist_range_cm=(15., 40.), ang_width_deg=(80., 170.)):
+    """
+    Build Layer-1 binary sensory features (Type-1: distance only; Type-2: distance+angle).
+    Each L1 unit randomly 'subscribes' to a subset of stimuli (probability p_responsive).
+    A unit fires if any subscribed stimulus is within its distance (and angle, for Type-2).
+    """
+    T = xy.shape[0]
+    n_stim = stim_xy.shape[0]
+
+    # precompute distances (to stimulus points) and egocentric angle differences
+    # vector from animal to stimulus
+    vec = stim_xy[None, :, :] - xy[:, None, :]
+    dists = np.linalg.norm(vec, axis=2)                # (T, n_stim)
+    bearings = (np.arctan2(vec[...,1], vec[...,0]) + 2*np.pi)%(2*np.pi)
+    # angular difference between head direction and bearing
+    dang = np.abs((bearings - hd[:, None] + np.pi)%(2*np.pi) - np.pi)  # in [0,pi]
+
+    # Random responsiveness masks for L1 units to stimuli
+    resp1 = rng.random((n_L1_type1, n_stim)) < p_responsive
+    resp2 = rng.random((n_L1_type2, n_stim)) < p_responsive
+
+    # Each unit has its own distance threshold; Type-2 also angle aperture
+    thr1 = rng.uniform(*dist_range_cm, size=n_L1_type1)
+    thr2 = rng.uniform(*dist_range_cm, size=n_L1_type2)
+    ang2 = np.deg2rad(rng.uniform(*ang_width_deg, size=n_L1_type2))/2.0  # half-width
+
+    L1_type1 = np.zeros((T, n_L1_type1), dtype=np.int8)
+    for i in range(n_L1_type1):
+        cond = (resp1[i] & (dists <= thr1[i])).any(axis=1)
+        L1_type1[:, i] = cond.astype(np.int8)
+
+    L1_type2 = np.zeros((T, n_L1_type2), dtype=np.int8)
+    for i in range(n_L1_type2):
+        cond = (resp2[i] & (dists <= thr2[i]) & (dang <= ang2[i])).any(axis=1)
+        L1_type2[:, i] = cond.astype(np.int8)
+
+    L1 = np.concatenate([L1_type1, L1_type2], axis=1)  # (T, 60)
+    return L1
+
+# -----------------------------------------
+# Competitive layers with winner-take-all
+# -----------------------------------------
+class CompetitiveLayer:
+    """
+    Winner-take-all clusters; Hebbian update that preserves per-unit weight sum.
+    """
+    def __init__(self, n_in, n_units, n_clusters, eta=0.05, seed=None):
+        assert n_units % n_clusters == 0
+        self.n_in = n_in
+        self.n_units = n_units
+        self.n_clusters = n_clusters
+        self.cluster_size = n_units // n_clusters
+        self.rng = np.random.default_rng(seed)
+        # weights normalised per postsynaptic unit
+        w = self.rng.random((n_units, n_in)).astype(np.float32)
+        self.W = (w.T / (w.sum(axis=1) + 1e-8)).T
+        self.eta = eta
+
+    def _cluster_slice(self, k):
+        a = k*self.cluster_size
+        return slice(a, a+self.cluster_size)
+
+    def forward(self, x_bin):  # x_bin ∈ {0,1}^n_in
+        # inner products per unit
+        z = self.W @ x_bin.astype(np.float32)
+        y = np.zeros(self.n_units, dtype=np.int8)
+        winners = []
+        for k in range(self.n_clusters):
+            sl = self._cluster_slice(k)
+            idx_local = np.argmax(z[sl])
+            win = sl.start + idx_local
+            winners.append(win)
+            y[win] = 1
+        return y, z, winners
+
+    def learn_on_winners(self, x_bin, winners):
+        x = x_bin.astype(np.float32)
+        for j in winners:
+            w = self.W[j]
+            # decay
+            decay = self.eta * w
+            w = w - decay
+            # redistribute the removed mass equally over active input lines
+            n_active = max(int(x.sum()), 1)
+            w += (decay.sum() / n_active) * x
+            # renormalise (safety)
+            s = w.sum()
+            if s > 0:
+                w /= s
+            self.W[j] = w
+
+# ----------------------------
+# Hippocampal “complex spike”
+# ----------------------------
+def complex_spike_rate(inner_prod):
+    # Paper: 1 spike if ≤0.25; 3 or 5 spikes if greater (we threshold again at 0.5)
+    if inner_prod <= 0.25:
+        return 1
+    elif inner_prod <= 0.5:
+        return 3
+    else:
+        return 5
+
+# ----------------------------
+# Full model & session
+# ----------------------------
+def run_session(seed=1, minutes=16, theta_hz=8):
+    rng = np.random.default_rng(seed)
+    T = minutes*60*theta_hz  # 7680 steps
+
+    env = CylinderEnv()
+    xy, hd = env.random_trajectory(T)
+
+    # Layer 1 (sensory “neocortex”): 60 units (30 type-1 + 30 type-2)
+    L1 = local_view_features(xy, hd, env.stim_xy)
+
+    # Layer 2 (“entorhinal”): 60 units in 3 clusters (winner-take-all)
+    EC = CompetitiveLayer(n_in=L1.shape[1], n_units=60, n_clusters=3, eta=0.05, seed=seed)
+
+    # Layer 3 (“hippocampus”): 20 units in 1 cluster (winner-take-all)
+    HPC = CompetitiveLayer(n_in=60, n_units=20, n_clusters=1, eta=0.05, seed=seed+1)
+
+    # Activity logs
+    hpc_spikes = np.zeros((T, 20), dtype=np.int16)
+
+    for t in range(T):
+        x1 = L1[t]
+        y_ec, z_ec, ec_win = EC.forward(x1)
+        EC.learn_on_winners(x1, ec_win)
+
+        y_h, z_h, h_win = HPC.forward(y_ec)
+        # Complex spike based on inner product of the single HPC winner
+        j = h_win[0]
+        rate = complex_spike_rate(z_h[j])
+        hpc_spikes[t, j] = rate
+        HPC.learn_on_winners(y_ec, h_win)
+
+    return env, xy, hd, hpc_spikes
+
+# ----------------------------
+# Make a firing-rate map
+# ----------------------------
+def rate_map_for_unit(env, xy, spikes_t, bin_cm=2.5, smoothing_sigma_bins=1.5):
+    # bins in y then x (so we can imshow(origin='lower') without transpose)
+    x, y = xy[:,0], xy[:,1]
+    xbins = np.arange(-env.R, env.R+bin_cm, bin_cm)
+    ybins = np.arange(-env.R, env.R+bin_cm, bin_cm)
+
+    # dwell time per sample (theta steps at 8 Hz)
+    dt = 1/8.0  # s
+
+    dwell, _, _ = np.histogram2d(y, x, bins=(ybins, xbins))
+    dwell = dwell * dt  # seconds
+
+    spike_counts, _, _ = np.histogram2d(y, x, bins=(ybins, xbins), weights=spikes_t.astype(float))
+
+    # Gaussian smoothing (optional)
+    if smoothing_sigma_bins is not None and smoothing_sigma_bins > 0:
+        from scipy.ndimage import gaussian_filter
+        dwell = gaussian_filter(dwell, sigma=smoothing_sigma_bins, mode='constant')
+        spike_counts = gaussian_filter(spike_counts, sigma=smoothing_sigma_bins, mode='constant')
+
+    fr = np.divide(spike_counts, dwell, out=np.zeros_like(spike_counts), where=dwell>0)  # Hz
+    extent = [xbins[0], xbins[-1], ybins[0], ybins[-1]]
+    return fr, extent
+
+# ----------------------------
+# Run & plot
+# ----------------------------
+env, xy, hd, hsp = run_session(seed=3)
+
+# pick the most active hippocampal unit
+tot = hsp.sum(axis=0)
+cell = int(np.argmax(tot))
+fr, extent = rate_map_for_unit(env, xy, hsp[:, cell])
+
+fig, axs = plt.subplots(1, 2, figsize=(8, 4))
+# left: trajectory with spike locations (red)
+axs[0].plot(xy[:,0], xy[:,1], 'k-', alpha=0.25, linewidth=0.8)
+spk_xy = xy[hsp[:,cell] > 0]
+axs[0].plot(spk_xy[:,0], spk_xy[:,1], 'r.', ms=2)
+axs[0].set_aspect('equal'); axs[0].set_title(f"Trajectory & spikes (cell {cell})")
+axs[0].set_xlabel("x (cm)"); axs[0].set_ylabel("y (cm)")
+
+# right: firing-rate map
+im = axs[1].imshow(fr, origin='lower', extent=extent, cmap='viridis')
+axs[1].set_aspect('equal'); axs[1].set_title("Firing-rate map (Hz)")
+axs[1].set_xticks([]); axs[1].set_yticks([])
+fig.colorbar(im, ax=axs[1], fraction=0.046, pad=0.04)
+plt.tight_layout()
+plt.show()
